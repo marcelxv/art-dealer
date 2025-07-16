@@ -57,7 +57,7 @@ function testArtworkGeneration() {
   }
   
   // Analyze periods
-  const periods = artworks.map(a => a.period).filter(Boolean)
+  const periods = artworks.map(a => a.period).filter(Boolean) as string[]
   const periodCounts = periods.reduce((acc, period) => {
     acc[period] = (acc[period] || 0) + 1
     return acc
@@ -72,7 +72,7 @@ function testArtworkGeneration() {
     })
   
   // Analyze artists
-  const artists = artworks.map(a => a.artist).filter(Boolean)
+  const artists = artworks.map(a => a.artist).filter(Boolean) as string[]
   const artistCounts = artists.reduce((acc, artist) => {
     acc[artist] = (acc[artist] || 0) + 1
     return acc
