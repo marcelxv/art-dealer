@@ -1,7 +1,7 @@
 'use client'
 
-import { useEffect, useState, Suspense } from 'react'
-import { useSearchParams } from 'next/navigation'
+import { useEffect, useState, Suspense, useCallback, useMemo } from 'react'
+import { useSearchParams, useRouter, usePathname } from 'next/navigation'
 import { Header } from '@/components/layout/Header'
 import { ArtworkCard } from '@/components/artwork/ArtworkCard'
 import { Button } from '@/components/ui/button'
@@ -10,31 +10,97 @@ import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Artwork } from '@/lib/supabase'
 import { fetchArtworks, ArtworkFilters } from '@/lib/api'
-import { Search, Filter, X } from 'lucide-react'
+import { Search, Filter, X, Loader2 } from 'lucide-react'
+
+// Custom hook for URL state management
+function useURLState() {
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+
+  const updateURL = useCallback((filters: ArtworkFilters, page?: number) => {
+    const params = new URLSearchParams()
+    
+    // Only add non-empty values to URL
+    if (filters.search?.trim()) params.set('q', filters.search.trim())
+    if (filters.period?.trim()) params.set('period', filters.period.trim())
+    if (filters.artist?.trim()) params.set('artist', filters.artist.trim())
+    if (filters.museum?.trim()) params.set('museum', filters.museum.trim())
+    if (page && page > 1) params.set('page', page.toString())
+
+    const queryString = params.toString()
+    const url = queryString ? `${pathname}?${queryString}` : pathname
+
+    // Use replace for filter changes to avoid cluttering browser history
+    router.replace(url, { scroll: false })
+  }, [router, pathname])
+
+  const getFiltersFromURL = useCallback((): ArtworkFilters & { page: number } => {
+    return {
+      search: searchParams.get('q') || '',
+      period: searchParams.get('period') || '',
+      artist: searchParams.get('artist') || '',
+      museum: searchParams.get('museum') || '',
+      page: parseInt(searchParams.get('page') || '1', 10)
+    }
+  }, [searchParams])
+
+  return { updateURL, getFiltersFromURL }
+}
+
+// Custom hook for debounced search
+function useDebounced<T>(value: T, delay: number): T {
+  const [debouncedValue, setDebouncedValue] = useState<T>(value)
+
+  useEffect(() => {
+    const handler = setTimeout(() => setDebouncedValue(value), delay)
+    return () => clearTimeout(handler)
+  }, [value, delay])
+
+  return debouncedValue
+}
 
 function SearchPageContent() {
-  const searchParams = useSearchParams()
+  const { updateURL, getFiltersFromURL } = useURLState()
+  
+  // Initialize state from URL
+  const initialState = useMemo(() => getFiltersFromURL(), [getFiltersFromURL])
+  
   const [artworks, setArtworks] = useState<Artwork[]>([])
   const [loading, setLoading] = useState(false)
-  const [searchQuery, setSearchQuery] = useState(searchParams.get('q') || '')
+  const [searchQuery, setSearchQuery] = useState(initialState.search)
   const [filters, setFilters] = useState<ArtworkFilters>({
-    search: searchParams.get('q') || '',
-    period: '',
-    artist: '',
-    museum: '',
+    search: initialState.search,
+    period: initialState.period,
+    artist: initialState.artist,
+    museum: initialState.museum,
   })
-  const [page, setPage] = useState(1)
+  const [page, setPage] = useState(initialState.page)
   const [hasMore, setHasMore] = useState(true)
   const [totalCount, setTotalCount] = useState(0)
   const [showFilters, setShowFilters] = useState(false)
 
-  const searchArtworks = async (pageNum: number = 1, newFilters?: ArtworkFilters) => {
+  // Debounce search query to avoid too many API calls
+  const debouncedSearchQuery = useDebounced(searchQuery, 300)
+
+  // Update search filter when debounced query changes
+  useEffect(() => {
+    if (debouncedSearchQuery !== filters.search) {
+      setFilters(prev => ({ ...prev, search: debouncedSearchQuery }))
+    }
+  }, [debouncedSearchQuery, filters.search])
+
+  const searchArtworks = useCallback(async (
+    pageNum: number = 1, 
+    searchFilters?: ArtworkFilters,
+    shouldReset: boolean = true
+  ) => {
     try {
       setLoading(true)
-      const currentFilters = newFilters || filters
+      const currentFilters = searchFilters || filters
       const response = await fetchArtworks(pageNum, 20, currentFilters)
       
-      if (pageNum === 1) {
+      if (shouldReset || pageNum === 1) {
         setArtworks(response.data)
       } else {
         setArtworks(prev => [...prev, ...response.data])
@@ -43,30 +109,47 @@ function SearchPageContent() {
       setHasMore(pageNum < response.totalPages)
       setPage(pageNum)
       setTotalCount(response.count)
+
+      // Update URL with current filters and page
+      updateURL(currentFilters, pageNum > 1 ? pageNum : undefined)
     } catch (error) {
       console.error('Error searching artworks:', error)
     } finally {
       setLoading(false)
     }
-  }
+  }, [filters, updateURL])
 
+  // Search when filters change (but not on initial load if no filters)
   useEffect(() => {
-    if (filters.search || filters.period || filters.artist || filters.museum) {
-      searchArtworks()
+    const hasActiveFilters = filters.search || filters.period || filters.artist || filters.museum
+    
+    if (hasActiveFilters) {
+      searchArtworks(1, filters, true)
+    } else if (artworks.length > 0) {
+      // Clear results if no filters and we had results before
+      setArtworks([])
+      setTotalCount(0)
+      updateURL(filters)
     }
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters]) // searchArtworks and updateURL intentionally excluded to avoid infinite loop
 
+  // Handle form submission (for explicit search button clicks)
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault()
     const newFilters = { ...filters, search: searchQuery }
     setFilters(newFilters)
-    searchArtworks(1, newFilters)
+    searchArtworks(1, newFilters, true)
   }
 
   const handleFilterChange = (key: keyof ArtworkFilters, value: string) => {
     const newFilters = { ...filters, [key]: value }
     setFilters(newFilters)
-    searchArtworks(1, newFilters)
+    
+    // For non-search filters, update immediately
+    if (key !== 'search') {
+      searchArtworks(1, newFilters, true)
+    }
   }
 
   const handleClearFilters = () => {
@@ -75,13 +158,22 @@ function SearchPageContent() {
     setSearchQuery('')
     setArtworks([])
     setTotalCount(0)
+    setPage(1)
+    updateURL(clearedFilters)
   }
 
   const handleLoadMore = () => {
-    searchArtworks(page + 1)
+    searchArtworks(page + 1, filters, false)
   }
 
   const hasActiveFilters = filters.search || filters.period || filters.artist || filters.museum
+
+  // Auto-expand filters if there are filter params in URL
+  useEffect(() => {
+    if (filters.period || filters.artist || filters.museum) {
+      setShowFilters(true)
+    }
+  }, [filters.period, filters.artist, filters.museum])
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -97,13 +189,18 @@ function SearchPageContent() {
           {/* Search Form */}
           <div className="space-y-4">
             <form onSubmit={handleSearch} className="flex gap-2">
-              <Input
-                type="text"
-                placeholder="Search artworks, artists, museums..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="flex-1"
-              />
+              <div className="relative flex-1">
+                <Input
+                  type="text"
+                  placeholder="Search artworks, artists, museums..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="flex-1 pr-10"
+                />
+                {loading && searchQuery && (
+                  <Loader2 className="h-4 w-4 animate-spin absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400" />
+                )}
+              </div>
               <Button type="submit" disabled={loading}>
                 <Search className="h-4 w-4 mr-2" />
                 Search
@@ -112,9 +209,15 @@ function SearchPageContent() {
                 type="button"
                 variant="outline"
                 onClick={() => setShowFilters(!showFilters)}
+                className={showFilters ? 'bg-blue-50 border-blue-300' : ''}
               >
                 <Filter className="h-4 w-4 mr-2" />
                 Filters
+                {(filters.period || filters.artist || filters.museum) && (
+                  <span className="ml-1 bg-blue-500 text-white text-xs rounded-full px-1.5 py-0.5">
+                    {[filters.period, filters.artist, filters.museum].filter(Boolean).length}
+                  </span>
+                )}
               </Button>
             </form>
 
@@ -174,9 +277,12 @@ function SearchPageContent() {
               <div className="flex flex-wrap gap-2">
                 {filters.search && (
                   <div className="flex items-center gap-1 bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm">
-                                         <span>Search: &ldquo;{filters.search}&rdquo;</span>
+                    <span>Search: &ldquo;{filters.search}&rdquo;</span>
                     <button 
-                      onClick={() => handleFilterChange('search', '')}
+                      onClick={() => {
+                        setSearchQuery('')
+                        handleFilterChange('search', '')
+                      }}
                       className="ml-1 hover:bg-blue-200 rounded-full p-0.5"
                     >
                       <X className="h-3 w-3" />
@@ -221,12 +327,26 @@ function SearchPageContent() {
           </div>
         </div>
 
-        {/* Results */}
+        {/* Search Results Count */}
         <div className="mb-4">
           {hasActiveFilters && (
-            <p className="text-gray-600">
-              {loading ? 'Searching...' : `Found ${totalCount} result${totalCount !== 1 ? 's' : ''}`}
-            </p>
+            <div className="flex items-center gap-2">
+              <p className="text-gray-600">
+                {loading ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Searching...
+                  </span>
+                ) : (
+                  `Found ${totalCount.toLocaleString()} result${totalCount !== 1 ? 's' : ''}`
+                )}
+              </p>
+              {page > 1 && (
+                <span className="text-sm text-gray-500">
+                  (Page {page})
+                </span>
+              )}
+            </div>
           )}
         </div>
 
@@ -252,24 +372,51 @@ function SearchPageContent() {
             
             {hasMore && (
               <div className="flex justify-center mt-8">
-                <Button onClick={handleLoadMore} disabled={loading} variant="outline">
-                  {loading ? 'Loading...' : 'Load More'}
+                <Button 
+                  onClick={handleLoadMore} 
+                  disabled={loading} 
+                  variant="outline"
+                  className="min-w-32"
+                >
+                  {loading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                      Loading...
+                    </>
+                  ) : (
+                    'Load More'
+                  )}
                 </Button>
               </div>
             )}
           </>
         ) : hasActiveFilters ? (
           <div className="text-center py-12">
-            <p className="text-gray-500 text-lg">No artworks found.</p>
-            <p className="text-gray-400 mt-2">Try adjusting your search terms or filters.</p>
-            <Button variant="ghost" onClick={handleClearFilters} className="mt-4">
-              Clear all filters
-            </Button>
+            <div className="max-w-md mx-auto">
+              <div className="w-16 h-16 mx-auto mb-4 text-gray-300">
+                <Search className="w-full h-full" />
+              </div>
+              <p className="text-gray-500 text-lg mb-2">No artworks found</p>
+              <p className="text-gray-400 mb-4">
+                Try adjusting your search terms or filters to find more results.
+              </p>
+              <Button variant="ghost" onClick={handleClearFilters}>
+                <X className="h-4 w-4 mr-2" />
+                Clear all filters
+              </Button>
+            </div>
           </div>
         ) : (
           <div className="text-center py-12">
-            <p className="text-gray-500 text-lg">Start your search above</p>
-            <p className="text-gray-400 mt-2">Enter a search term or use filters to find artworks.</p>
+            <div className="max-w-md mx-auto">
+              <div className="w-16 h-16 mx-auto mb-4 text-gray-300">
+                <Search className="w-full h-full" />
+              </div>
+              <p className="text-gray-500 text-lg mb-2">Discover amazing artworks</p>
+              <p className="text-gray-400">
+                Enter a search term or use filters above to explore our collection of iconic artworks.
+              </p>
+            </div>
           </div>
         )}
       </main>
@@ -303,5 +450,3 @@ export default function SearchPage() {
     </Suspense>
   )
 }
-
- 
